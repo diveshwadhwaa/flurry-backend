@@ -10,7 +10,12 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 
-CORS(app, origins=["*"])
+CORS(app, origins=[
+    "http://127.0.0.1:5500",
+    "https://flurrybuddy.com",
+    "https://www.flurrybuddy.com",
+    "https://jazzy-manatee-54a1b8.netlify.app"
+])
 
 RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "rzp_test_placeholder")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "placeholder")
