@@ -7,6 +7,8 @@ from datetime import datetime
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 
@@ -26,6 +28,8 @@ FROM_EMAIL          = os.environ.get("FROM_EMAIL",          "hello@flurrybuddy.c
 FROM_NAME           = os.environ.get("FROM_NAME",           "Flurry Buddy")
 SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@flurrybuddy.com")
 ADMIN_NOTIFY_EMAIL  = os.environ.get("ADMIN_NOTIFY_EMAIL",  SUPPORT_EMAIL)
+AUTH_SECRET         = os.environ.get("AUTH_SECRET",         ADMIN_SECRET_KEY)
+AUTH_MAX_AGE        = 60 * 60 * 24 * 30
 
 # Lazy imports so server starts even if packages have issues
 def get_razorpay_client():
@@ -65,6 +69,17 @@ def init_db():
                 confirmed_at        TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                name          TEXT NOT NULL,
+                email         TEXT UNIQUE NOT NULL,
+                phone         TEXT,
+                password_hash TEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS user_id INTEGER")
         conn.commit()
         cur.close()
         conn.close()
@@ -74,6 +89,52 @@ def init_db():
 
 def is_admin(req):
     return req.headers.get("X-Admin-Key") == ADMIN_SECRET_KEY
+
+def auth_serializer():
+    return URLSafeTimedSerializer(AUTH_SECRET, salt="flurry-buddy-auth")
+
+def make_auth_token(user_id):
+    return auth_serializer().dumps({"user_id": user_id})
+
+def get_auth_user(required=False):
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "", 1).strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        if required:
+            return None, (jsonify({"error": "Login required"}), 401)
+        return None, None
+    try:
+        data = auth_serializer().loads(token, max_age=AUTH_MAX_AGE)
+        user_id = int(data.get("user_id"))
+    except (BadSignature, SignatureExpired, ValueError, TypeError):
+        if required:
+            return None, (jsonify({"error": "Session expired. Please log in again."}), 401)
+        return None, None
+
+    if not DATABASE_URL:
+        if required:
+            return None, (jsonify({"error": "Accounts are not available yet"}), 503)
+        return None, None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, email, phone FROM users WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            if required:
+                return None, (jsonify({"error": "User not found"}), 404)
+            return None, None
+        return {"id": row[0], "name": row[1], "email": row[2], "phone": row[3] or ""}, None
+    except Exception as e:
+        print("[AUTH] user lookup error:", e)
+        if required:
+            return None, (jsonify({"error": "Could not load account"}), 500)
+        return None, None
+
+def clean_email(email):
+    return (email or "").strip().lower()
 
 def rupees_from_paise(amount):
     try:
@@ -179,6 +240,113 @@ def send_order_email(order_id, customer, items, amount):
 def health():
     return jsonify({"status": "ok", "message": "Flurry Buddy backend is running!"})
 
+@app.route("/auth/signup", methods=["POST"])
+def auth_signup():
+    if not DATABASE_URL:
+        return jsonify({"error": "Accounts are not available yet"}), 503
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    email = clean_email(data.get("email"))
+    phone = (data.get("phone") or "").strip()
+    password = data.get("password") or ""
+
+    if len(name) < 2:
+        return jsonify({"error": "Please enter your name"}), 400
+    if "@" not in email or "." not in email:
+        return jsonify({"error": "Please enter a valid email"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"error": "An account already exists with this email"}), 409
+        cur.execute("""
+            INSERT INTO users (name, email, phone, password_hash, created_at)
+            VALUES (%s,%s,%s,%s,NOW())
+            RETURNING id, name, email, phone
+        """, (name, email, phone, generate_password_hash(password)))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        user = {"id": row[0], "name": row[1], "email": row[2], "phone": row[3] or ""}
+        return jsonify({"token": make_auth_token(user["id"]), "user": user})
+    except Exception as e:
+        print("[AUTH] signup error:", e)
+        return jsonify({"error": "Could not create account"}), 500
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    if not DATABASE_URL:
+        return jsonify({"error": "Accounts are not available yet"}), 503
+    data = request.get_json() or {}
+    email = clean_email(data.get("email"))
+    password = data.get("password") or ""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, email, phone, password_hash FROM users WHERE email=%s", (email,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row or not check_password_hash(row[4], password):
+            return jsonify({"error": "Incorrect email or password"}), 401
+        user = {"id": row[0], "name": row[1], "email": row[2], "phone": row[3] or ""}
+        return jsonify({"token": make_auth_token(user["id"]), "user": user})
+    except Exception as e:
+        print("[AUTH] login error:", e)
+        return jsonify({"error": "Could not log in"}), 500
+
+@app.route("/auth/me", methods=["GET"])
+def auth_me():
+    user, err = get_auth_user(required=True)
+    if err:
+        return err
+    return jsonify({"user": user})
+
+@app.route("/auth/orders", methods=["GET"])
+def auth_orders():
+    user, err = get_auth_user(required=True)
+    if err:
+        return err
+    if not DATABASE_URL:
+        return jsonify({"orders": []})
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT order_id, razorpay_payment_id, amount, status, items, confirmed_at
+            FROM orders
+            WHERE status='paid' AND (user_id=%s OR LOWER(customer_email)=LOWER(%s))
+            ORDER BY confirmed_at DESC
+        """, (user["id"], user["email"]))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        orders = []
+        for row in rows:
+            try:
+                items = json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
+            except Exception:
+                items = []
+            orders.append({
+                "order_id": row[0],
+                "payment_id": row[1],
+                "amount": row[2],
+                "status": row[3],
+                "items": items,
+                "confirmed_at": row[5].isoformat() if row[5] else ""
+            })
+        return jsonify({"orders": orders})
+    except Exception as e:
+        print("[AUTH] orders error:", e)
+        return jsonify({"error": "Could not load orders"}), 500
+
 @app.route("/create-order", methods=["POST"])
 def create_order():
     try:
@@ -187,6 +355,8 @@ def create_order():
         currency = data.get("currency", "INR")
         customer = data.get("customer", {})
         items    = data.get("items", [])
+        auth_user, _ = get_auth_user(required=False)
+        user_id = auth_user.get("id") if auth_user else None
 
         if amount <= 0:
             return jsonify({"error": "Invalid amount"}), 400
@@ -208,8 +378,8 @@ def create_order():
                         (order_id, razorpay_order_id, amount, currency, status,
                          customer_name, customer_email, customer_phone,
                          customer_address, customer_city, customer_state,
-                         customer_pin, items, created_at)
-                    VALUES (%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                         customer_pin, items, user_id, created_at)
+                    VALUES (%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                     ON CONFLICT (order_id) DO NOTHING
                 """, (
                     "PENDING-" + rzp_order["id"],
@@ -222,7 +392,8 @@ def create_order():
                     customer.get("city",""),
                     customer.get("state",""),
                     customer.get("pin",""),
-                    json.dumps(items)
+                    json.dumps(items),
+                    user_id
                 ))
                 conn.commit()
                 cur.close()
@@ -250,6 +421,8 @@ def verify_payment():
         customer       = data.get("customer", {})
         items          = data.get("items", [])
         amount         = data.get("amount", 0)
+        auth_user, _ = get_auth_user(required=False)
+        user_id = auth_user.get("id") if auth_user else None
 
         if not all([rzp_order_id, rzp_payment_id, rzp_signature]):
             return jsonify({"error": "Missing payment details"}), 400
@@ -278,8 +451,8 @@ def verify_payment():
                          amount, currency, status,
                          customer_name, customer_email, customer_phone,
                          customer_address, customer_city, customer_state,
-                         customer_pin, items, created_at, confirmed_at)
-                    VALUES (%s,%s,%s,%s,'INR','paid',%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+                         customer_pin, items, user_id, created_at, confirmed_at)
+                    VALUES (%s,%s,%s,%s,'INR','paid',%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
                     ON CONFLICT (order_id) DO NOTHING
                 """, (
                     order_id,
@@ -294,6 +467,7 @@ def verify_payment():
                     customer.get("state",""),
                     customer.get("pin",""),
                     json.dumps(items),
+                    user_id,
                     confirmed_at
                 ))
                 conn.commit()
