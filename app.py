@@ -4,6 +4,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime
+from html import escape
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -27,6 +28,7 @@ BREVO_API_KEY       = os.environ.get("BREVO_API_KEY",       "")
 FROM_EMAIL          = os.environ.get("FROM_EMAIL",          "hello@flurrybuddy.com")
 FROM_NAME           = os.environ.get("FROM_NAME",           "Flurry Buddy")
 SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@flurrybuddy.com")
+ADMIN_NOTIFY_EMAIL  = os.environ.get("ADMIN_NOTIFY_EMAIL",  SUPPORT_EMAIL)
 AUTH_SECRET         = os.environ.get("AUTH_SECRET",         ADMIN_SECRET_KEY)
 AUTH_MAX_AGE        = 60 * 60 * 24 * 30
 
@@ -141,22 +143,59 @@ def rupees_from_paise(amount):
     except Exception:
         return "Rs.0"
 
+def customer_full_address(customer):
+    customer = customer or {}
+    line = (customer.get("address") or "").strip()
+    city = (customer.get("city") or "").strip()
+    state = (customer.get("state") or "").strip()
+    pin = (customer.get("pin") or "").strip()
+    parts = [p for p in [line, city, state] if p]
+    address = ", ".join(parts)
+    if pin:
+        address = (address + " - " if address else "") + pin
+    return address
+
 def order_items_html(items):
     rows = []
     for item in items or []:
-        name = item.get("name", "Flurry Buddy")
+        name = escape(str(item.get("name", "Flurry Buddy")))
+        color = escape(str(item.get("color", "")))
         qty = item.get("qty", 1)
         price = item.get("price", 0)
+        item_name = name + (f"<br><span style='font-size:12px;color:#8b7ab8;'>Color: {color}</span>" if color else "")
         rows.append(
             "<tr>"
-            f"<td style='padding:8px 0;border-bottom:1px solid #eee;'>{name}</td>"
+            f"<td style='padding:8px 0;border-bottom:1px solid #eee;'>{item_name}</td>"
             f"<td style='padding:8px 0;border-bottom:1px solid #eee;text-align:center;'>x{qty}</td>"
             f"<td style='padding:8px 0;border-bottom:1px solid #eee;text-align:right;'>Rs.{int(price) * int(qty):,}</td>"
             "</tr>"
         )
     return "".join(rows)
 
-def send_order_email(order_id, customer, items, amount):
+def customer_details_html(customer):
+    customer = customer or {}
+    rows = [
+        ("Name", customer.get("name", "")),
+        ("Mobile", customer.get("phone", "")),
+        ("Email", customer.get("email", "")),
+        ("Address", customer_full_address(customer)),
+    ]
+    return "".join(
+        "<tr>"
+        f"<td style='padding:8px 0;border-bottom:1px solid #eee;font-weight:700;'>{escape(label)}</td>"
+        f"<td style='padding:8px 0;border-bottom:1px solid #eee;text-align:right;'>{escape(str(value or '-'))}</td>"
+        "</tr>"
+        for label, value in rows
+    )
+
+def brevo_headers():
+    return {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json"
+    }
+
+def send_order_email(order_id, customer, items, amount, payment_id=""):
     if not BREVO_API_KEY:
         print("[EMAIL] BREVO_API_KEY not set, skipping customer email")
         return False
@@ -190,7 +229,7 @@ def send_order_email(order_id, customer, items, amount):
     </div>
     """
 
-    payload = {
+    customer_payload = {
         "sender": {"name": FROM_NAME, "email": FROM_EMAIL},
         "to": [{"email": customer_email, "name": customer_name}],
         "replyTo": {"email": SUPPORT_EMAIL, "name": FROM_NAME},
@@ -202,12 +241,8 @@ def send_order_email(order_id, customer, items, amount):
         import requests
         resp = requests.post(
             "https://api.brevo.com/v3/smtp/email",
-            headers={
-                "accept": "application/json",
-                "api-key": BREVO_API_KEY,
-                "content-type": "application/json"
-            },
-            json=payload,
+            headers=brevo_headers(),
+            json=customer_payload,
             timeout=12
         )
         if resp.status_code >= 300:
@@ -215,6 +250,47 @@ def send_order_email(order_id, customer, items, amount):
             return False
 
         print("[EMAIL] Confirmation sent to", customer_email)
+        if ADMIN_NOTIFY_EMAIL and ADMIN_NOTIFY_EMAIL.lower() != customer_email.lower():
+            admin_html = f"""
+            <div style="font-family:Arial,sans-serif;background:#f4edff;padding:28px;color:#4a3460;">
+              <div style="max-width:680px;margin:auto;background:#ffffff;border-radius:18px;padding:26px;">
+                <h2 style="color:#7c5cbf;margin:0 0 10px;">New Flurry Buddy order</h2>
+                <p style="margin:0 0 14px;"><strong>Order ID:</strong> {escape(order_id)}</p>
+                <p style="margin:0 0 18px;"><strong>Payment ID:</strong> {escape(payment_id or "-")}</p>
+                <h3 style="color:#7c5cbf;margin:18px 0 8px;">Customer details</h3>
+                <table style="width:100%;border-collapse:collapse;">{customer_details_html(customer)}</table>
+                <h3 style="color:#7c5cbf;margin:22px 0 8px;">Product details</h3>
+                <table style="width:100%;border-collapse:collapse;">
+                  <thead>
+                    <tr>
+                      <th style="text-align:left;padding-bottom:8px;">Product</th>
+                      <th style="text-align:center;padding-bottom:8px;">Qty</th>
+                      <th style="text-align:right;padding-bottom:8px;">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>{order_items_html(items)}</tbody>
+                </table>
+                <p style="font-size:18px;font-weight:800;color:#7c5cbf;">Total paid: {rupees_from_paise(amount)}</p>
+              </div>
+            </div>
+            """
+            admin_payload = {
+                "sender": {"name": FROM_NAME, "email": FROM_EMAIL},
+                "to": [{"email": ADMIN_NOTIFY_EMAIL, "name": "Flurry Buddy"}],
+                "replyTo": {"email": customer_email, "name": customer_name},
+                "subject": f"New Flurry Buddy order - {order_id}",
+                "htmlContent": admin_html
+            }
+            admin_resp = requests.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers=brevo_headers(),
+                json=admin_payload,
+                timeout=12
+            )
+            if admin_resp.status_code >= 300:
+                print("[EMAIL] Admin notification failed:", admin_resp.status_code, admin_resp.text)
+            else:
+                print("[EMAIL] Admin notification sent to", ADMIN_NOTIFY_EMAIL)
         return True
     except Exception as e:
         print("[EMAIL] Error:", e)
@@ -461,7 +537,7 @@ def verify_payment():
                 print("[DB] verify_payment save error:", e)
 
         print("[ORDER CONFIRMED]", order_id, "|", customer.get("name"), "| Rs.", int(amount)//100)
-        email_sent = send_order_email(order_id, customer, items, amount)
+        email_sent = send_order_email(order_id, customer, items, amount, rzp_payment_id)
         return jsonify({"verified": True, "order_id": order_id, "email_sent": email_sent})
 
     except Exception as e:
@@ -472,7 +548,7 @@ def get_orders():
     if not is_admin(request):
         return jsonify({"error": "Unauthorized"}), 401
     if not DATABASE_URL:
-        return jsonify({"orders": [], "total_orders": 0, "total_revenue": 0, "total_items": 0, "avg_order": 0})
+        return jsonify({"orders": [], "total_orders": 0, "total_revenue": 0, "total_items": 0, "avg_order": 0, "database_connected": False})
     try:
         conn = get_db()
         cur  = conn.cursor()
@@ -500,9 +576,28 @@ def get_orders():
             if isinstance(o.get("items"), str):
                 try:    o["items"] = json.loads(o["items"])
                 except: o["items"] = []
-            total_revenue += o.get("amount", 0)
+            amount_paise = int(o.get("amount") or 0)
+            total_revenue += amount_paise
             for it in (o.get("items") or []):
                 total_items += it.get("qty", 0)
+            address_parts = [
+                o.get("customer_address") or "",
+                o.get("customer_city") or "",
+                o.get("customer_state") or ""
+            ]
+            full_address = ", ".join([p for p in address_parts if p])
+            if o.get("customer_pin"):
+                full_address = (full_address + " - " if full_address else "") + str(o.get("customer_pin"))
+            o.update({
+                "orderId": o.get("order_id") or "",
+                "paymentId": o.get("razorpay_payment_id") or "",
+                "date": o.get("confirmed_at") or "",
+                "name": o.get("customer_name") or "",
+                "email": o.get("customer_email") or "",
+                "phone": o.get("customer_phone") or "",
+                "address": full_address,
+                "total": round(amount_paise / 100),
+            })
             orders.append(o)
 
         avg = (total_revenue // len(orders)) if orders else 0
@@ -511,7 +606,8 @@ def get_orders():
             "total_orders":  len(orders),
             "total_revenue": total_revenue,
             "total_items":   total_items,
-            "avg_order":     avg
+            "avg_order":     avg,
+            "database_connected": True
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
