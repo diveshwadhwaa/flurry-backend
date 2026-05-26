@@ -27,7 +27,6 @@ BREVO_API_KEY       = os.environ.get("BREVO_API_KEY",       "")
 FROM_EMAIL          = os.environ.get("FROM_EMAIL",          "hello@flurrybuddy.com")
 FROM_NAME           = os.environ.get("FROM_NAME",           "Flurry Buddy")
 SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@flurrybuddy.com")
-ADMIN_NOTIFY_EMAIL  = os.environ.get("ADMIN_NOTIFY_EMAIL",  SUPPORT_EMAIL)
 AUTH_SECRET         = os.environ.get("AUTH_SECRET",         ADMIN_SECRET_KEY)
 AUTH_MAX_AGE        = 60 * 60 * 24 * 30
 
@@ -214,21 +213,6 @@ def send_order_email(order_id, customer, items, amount):
         if resp.status_code >= 300:
             print("[EMAIL] Brevo send failed:", resp.status_code, resp.text)
             return False
-
-        if ADMIN_NOTIFY_EMAIL and ADMIN_NOTIFY_EMAIL.lower() != customer_email.lower():
-            admin_payload = dict(payload)
-            admin_payload["to"] = [{"email": ADMIN_NOTIFY_EMAIL, "name": "Flurry Buddy"}]
-            admin_payload["subject"] = f"New Flurry Buddy order - {order_id}"
-            requests.post(
-                "https://api.brevo.com/v3/smtp/email",
-                headers={
-                    "accept": "application/json",
-                    "api-key": BREVO_API_KEY,
-                    "content-type": "application/json"
-                },
-                json=admin_payload,
-                timeout=12
-            )
 
         print("[EMAIL] Confirmation sent to", customer_email)
         return True
