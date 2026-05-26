@@ -21,6 +21,11 @@ RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "rzp_test_placeholde
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "placeholder")
 ADMIN_SECRET_KEY    = os.environ.get("ADMIN_SECRET_KEY",    "flurry-admin-secret-2025")
 DATABASE_URL        = os.environ.get("DATABASE_URL",        "")
+BREVO_API_KEY       = os.environ.get("BREVO_API_KEY",       "")
+FROM_EMAIL          = os.environ.get("FROM_EMAIL",          "hello@flurrybuddy.com")
+FROM_NAME           = os.environ.get("FROM_NAME",           "Flurry Buddy")
+SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@flurrybuddy.com")
+ADMIN_NOTIFY_EMAIL  = os.environ.get("ADMIN_NOTIFY_EMAIL",  SUPPORT_EMAIL)
 
 # Lazy imports so server starts even if packages have issues
 def get_razorpay_client():
@@ -69,6 +74,106 @@ def init_db():
 
 def is_admin(req):
     return req.headers.get("X-Admin-Key") == ADMIN_SECRET_KEY
+
+def rupees_from_paise(amount):
+    try:
+        return "Rs.{:,.0f}".format(int(amount) / 100)
+    except Exception:
+        return "Rs.0"
+
+def order_items_html(items):
+    rows = []
+    for item in items or []:
+        name = item.get("name", "Flurry Buddy")
+        qty = item.get("qty", 1)
+        price = item.get("price", 0)
+        rows.append(
+            "<tr>"
+            f"<td style='padding:8px 0;border-bottom:1px solid #eee;'>{name}</td>"
+            f"<td style='padding:8px 0;border-bottom:1px solid #eee;text-align:center;'>x{qty}</td>"
+            f"<td style='padding:8px 0;border-bottom:1px solid #eee;text-align:right;'>Rs.{int(price) * int(qty):,}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+def send_order_email(order_id, customer, items, amount):
+    if not BREVO_API_KEY:
+        print("[EMAIL] BREVO_API_KEY not set, skipping customer email")
+        return False
+
+    customer_email = (customer or {}).get("email", "").strip()
+    customer_name  = (customer or {}).get("name", "there").strip() or "there"
+    if not customer_email:
+        print("[EMAIL] Customer email missing, skipping")
+        return False
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;background:#f4edff;padding:28px;color:#4a3460;">
+      <div style="max-width:620px;margin:auto;background:#ffffff;border-radius:22px;padding:28px;box-shadow:0 8px 32px rgba(124,92,191,0.14);">
+        <h1 style="color:#7c5cbf;margin:0 0 8px;">Your buddy is officially adopted 💜</h1>
+        <p style="font-size:16px;line-height:1.6;">Hi {customer_name}, thank you for ordering from Flurry Buddy. Your cozy little friend is getting packed with love and emotional support.</p>
+        <p style="font-weight:700;">Order ID: {order_id}</p>
+        <table style="width:100%;border-collapse:collapse;margin:18px 0;">
+          <thead>
+            <tr>
+              <th style="text-align:left;padding-bottom:8px;">Buddy</th>
+              <th style="text-align:center;padding-bottom:8px;">Qty</th>
+              <th style="text-align:right;padding-bottom:8px;">Amount</th>
+            </tr>
+          </thead>
+          <tbody>{order_items_html(items)}</tbody>
+        </table>
+        <p style="font-size:18px;font-weight:800;color:#7c5cbf;">Total paid: {rupees_from_paise(amount)}</p>
+        <p style="line-height:1.6;">We will share tracking details once your buddy ships ✨</p>
+        <p style="font-size:13px;color:#8b7ab8;">Questions? Reply to this email or write to {SUPPORT_EMAIL}.</p>
+      </div>
+    </div>
+    """
+
+    payload = {
+        "sender": {"name": FROM_NAME, "email": FROM_EMAIL},
+        "to": [{"email": customer_email, "name": customer_name}],
+        "replyTo": {"email": SUPPORT_EMAIL, "name": FROM_NAME},
+        "subject": f"Your Flurry Buddy order is confirmed - {order_id}",
+        "htmlContent": html
+    }
+
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_API_KEY,
+                "content-type": "application/json"
+            },
+            json=payload,
+            timeout=12
+        )
+        if resp.status_code >= 300:
+            print("[EMAIL] Brevo send failed:", resp.status_code, resp.text)
+            return False
+
+        if ADMIN_NOTIFY_EMAIL and ADMIN_NOTIFY_EMAIL.lower() != customer_email.lower():
+            admin_payload = dict(payload)
+            admin_payload["to"] = [{"email": ADMIN_NOTIFY_EMAIL, "name": "Flurry Buddy"}]
+            admin_payload["subject"] = f"New Flurry Buddy order - {order_id}"
+            requests.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={
+                    "accept": "application/json",
+                    "api-key": BREVO_API_KEY,
+                    "content-type": "application/json"
+                },
+                json=admin_payload,
+                timeout=12
+            )
+
+        print("[EMAIL] Confirmation sent to", customer_email)
+        return True
+    except Exception as e:
+        print("[EMAIL] Error:", e)
+        return False
 
 @app.route("/", methods=["GET"])
 def health():
@@ -198,7 +303,8 @@ def verify_payment():
                 print("[DB] verify_payment save error:", e)
 
         print("[ORDER CONFIRMED]", order_id, "|", customer.get("name"), "| Rs.", int(amount)//100)
-        return jsonify({"verified": True, "order_id": order_id})
+        email_sent = send_order_email(order_id, customer, items, amount)
+        return jsonify({"verified": True, "order_id": order_id, "email_sent": email_sent})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
