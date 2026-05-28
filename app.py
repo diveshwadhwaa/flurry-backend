@@ -160,9 +160,11 @@ def order_items_html(items):
     for item in items or []:
         name = escape(str(item.get("name", "Flurry Buddy")))
         color = escape(str(item.get("color", "")))
+        size = escape(str(item.get("size", "")))
         qty = item.get("qty", 1)
         price = item.get("price", 0)
         item_name = name + (f"<br><span style='font-size:12px;color:#8b7ab8;'>Color: {color}</span>" if color else "")
+        item_name += (f"<br><span style='font-size:12px;color:#8b7ab8;'>Size: {size}</span>" if size else "")
         rows.append(
             "<tr>"
             f"<td style='padding:8px 0;border-bottom:1px solid #eee;'>{item_name}</td>"
