@@ -17,7 +17,9 @@ CORS(app, origins=[
     "http://127.0.0.1:5500",
     "https://flurrybuddy.com",
     "https://www.flurrybuddy.com",
-    "https://jazzy-manatee-54a1b8.netlify.app"
+    "https://jazzy-manatee-54a1b8.netlify.app",
+    "https://flurrybuddy.pages.dev",
+    "https://flurry-buddy.pages.dev"
 ])
 
 RAZORPAY_KEY_ID     = os.environ.get("RAZORPAY_KEY_ID",     "rzp_test_placeholder")
