@@ -474,7 +474,12 @@ def admin_inventory():
             "database_connected": True
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print("[INVENTORY] admin inventory error:", e)
+        return jsonify({
+            "items": [],
+            "database_connected": False,
+            "error": str(e)
+        })
 
 @app.route("/admin/inventory", methods=["POST"])
 def update_admin_inventory():
@@ -691,7 +696,8 @@ def create_order():
                 except Exception:
                     pass
                 print("[DB] create_order save error:", e)
-                return jsonify({"error": "Could not reserve stock. Please try again."}), 500
+                # Do not block checkout when the database provider is down or misconfigured.
+                # Inventory protection is active only when DATABASE_URL is healthy.
 
         return jsonify({
             "razorpay_order_id": rzp_order["id"],
