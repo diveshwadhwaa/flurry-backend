@@ -31,6 +31,7 @@ SUPPORT_EMAIL       = os.environ.get("SUPPORT_EMAIL",       "support@flurrybuddy
 ADMIN_NOTIFY_EMAIL  = os.environ.get("ADMIN_NOTIFY_EMAIL",  SUPPORT_EMAIL)
 AUTH_SECRET         = os.environ.get("AUTH_SECRET",         ADMIN_SECRET_KEY)
 AUTH_MAX_AGE        = 60 * 60 * 24 * 30
+STOCK_HOLD_MINUTES  = int(os.environ.get("STOCK_HOLD_MINUTES", "5"))
 
 # Lazy imports so server starts even if packages have issues
 def get_razorpay_client():
@@ -78,6 +79,24 @@ def init_db():
                 phone         TEXT,
                 password_hash TEXT NOT NULL,
                 created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS inventory (
+                product_id   INTEGER PRIMARY KEY,
+                product_name TEXT,
+                stock        INTEGER NOT NULL DEFAULT 0,
+                updated_at   TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_reservations (
+                id                 SERIAL PRIMARY KEY,
+                razorpay_order_id  VARCHAR(100) UNIQUE NOT NULL,
+                items              TEXT NOT NULL,
+                status             VARCHAR(20) DEFAULT 'pending',
+                created_at         TIMESTAMP DEFAULT NOW(),
+                expires_at         TIMESTAMP NOT NULL
             )
         """)
         cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS user_id INTEGER")
@@ -136,6 +155,109 @@ def get_auth_user(required=False):
 
 def clean_email(email):
     return (email or "").strip().lower()
+
+def normalize_stock_items(items):
+    stock_items = {}
+    for item in items or []:
+        try:
+            product_id = int(item.get("id") or item.get("product_id") or 0)
+            qty = int(item.get("qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if product_id <= 0 or qty <= 0:
+            continue
+        if product_id not in stock_items:
+            stock_items[product_id] = {
+                "product_id": product_id,
+                "product_name": item.get("name") or "This item",
+                "qty": 0
+            }
+        stock_items[product_id]["qty"] += qty
+    return list(stock_items.values())
+
+def release_expired_stock(cur):
+    cur.execute("""
+        SELECT id, items
+        FROM stock_reservations
+        WHERE status='pending' AND expires_at < NOW()
+        FOR UPDATE
+    """)
+    rows = cur.fetchall()
+    released_ids = []
+    for reservation_id, raw_items in rows:
+        try:
+            items = json.loads(raw_items) if isinstance(raw_items, str) else (raw_items or [])
+        except Exception:
+            items = []
+        for item in normalize_stock_items(items):
+            cur.execute("""
+                UPDATE inventory
+                SET stock=stock+%s, updated_at=NOW()
+                WHERE product_id=%s
+            """, (item["qty"], item["product_id"]))
+        released_ids.append(reservation_id)
+    if released_ids:
+        cur.execute(
+            "UPDATE stock_reservations SET status='released' WHERE id = ANY(%s)",
+            (released_ids,)
+        )
+
+def reserve_stock(cur, razorpay_order_id, items):
+    requested_items = normalize_stock_items(items)
+    if not requested_items:
+        return None
+
+    release_expired_stock(cur)
+    product_ids = [item["product_id"] for item in requested_items]
+    cur.execute("""
+        SELECT product_id, product_name, stock
+        FROM inventory
+        WHERE product_id = ANY(%s)
+        FOR UPDATE
+    """, (product_ids,))
+    rows = cur.fetchall()
+    tracked = {
+        row[0]: {"name": row[1] or "This item", "stock": int(row[2] or 0)}
+        for row in rows
+    }
+
+    reserved_items = []
+    for item in requested_items:
+        product_id = item["product_id"]
+        if product_id not in tracked:
+            continue
+        available = tracked[product_id]["stock"]
+        if available < item["qty"]:
+            return {
+                "product_id": product_id,
+                "product_name": tracked[product_id]["name"],
+            }
+        reserved_items.append(item)
+
+    if not reserved_items:
+        return None
+
+    for item in reserved_items:
+        cur.execute("""
+            UPDATE inventory
+            SET stock=stock-%s, updated_at=NOW()
+            WHERE product_id=%s
+        """, (item["qty"], item["product_id"]))
+
+    cur.execute("""
+        INSERT INTO stock_reservations
+            (razorpay_order_id, items, status, created_at, expires_at)
+        VALUES (%s,%s,'pending',NOW(),NOW() + (%s * INTERVAL '1 minute'))
+        ON CONFLICT (razorpay_order_id) DO NOTHING
+    """, (razorpay_order_id, json.dumps(reserved_items), STOCK_HOLD_MINUTES))
+    return None
+
+def mark_stock_reservation_paid(cur, razorpay_order_id):
+    cur.execute("""
+        UPDATE stock_reservations
+        SET status='paid'
+        WHERE razorpay_order_id=%s AND status='pending'
+    """, (razorpay_order_id,))
 
 def rupees_from_paise(amount):
     try:
@@ -302,6 +424,91 @@ def send_order_email(order_id, customer, items, amount, payment_id=""):
 def health():
     return jsonify({"status": "ok", "message": "Flurry Buddy backend is running!"})
 
+@app.route("/inventory", methods=["GET"])
+def public_inventory():
+    if not DATABASE_URL:
+        return jsonify({"sold_out": [], "stock_hold_minutes": STOCK_HOLD_MINUTES})
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        release_expired_stock(cur)
+        cur.execute("SELECT product_id FROM inventory WHERE stock <= 0 ORDER BY product_id")
+        sold_out = [row[0] for row in cur.fetchall()]
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"sold_out": sold_out, "stock_hold_minutes": STOCK_HOLD_MINUTES})
+    except Exception as e:
+        print("[INVENTORY] public inventory error:", e)
+        return jsonify({"sold_out": [], "stock_hold_minutes": STOCK_HOLD_MINUTES})
+
+@app.route("/admin/inventory", methods=["GET"])
+def admin_inventory():
+    if not is_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify({"items": [], "database_connected": False})
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        release_expired_stock(cur)
+        cur.execute("""
+            SELECT product_id, product_name, stock, updated_at
+            FROM inventory
+            ORDER BY product_id
+        """)
+        items = []
+        for product_id, product_name, stock, updated_at in cur.fetchall():
+            items.append({
+                "product_id": product_id,
+                "product_name": product_name or "",
+                "stock": int(stock or 0),
+                "updated_at": updated_at.isoformat() if updated_at else ""
+            })
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "items": items,
+            "stock_hold_minutes": STOCK_HOLD_MINUTES,
+            "database_connected": True
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/inventory", methods=["POST"])
+def update_admin_inventory():
+    if not is_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify({"error": "Database is not connected"}), 503
+
+    data = request.get_json() or {}
+    items = data.get("items", [])
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for item in items:
+            product_id = int(item.get("product_id") or item.get("id") or 0)
+            stock = max(0, int(item.get("stock") or 0))
+            product_name = (item.get("product_name") or item.get("name") or "").strip()
+            if product_id <= 0:
+                continue
+            cur.execute("""
+                INSERT INTO inventory (product_id, product_name, stock, updated_at)
+                VALUES (%s,%s,%s,NOW())
+                ON CONFLICT (product_id)
+                DO UPDATE SET product_name=EXCLUDED.product_name,
+                              stock=EXCLUDED.stock,
+                              updated_at=NOW()
+            """, (product_id, product_name, stock))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/auth/signup", methods=["POST"])
 def auth_signup():
     if not DATABASE_URL:
@@ -432,9 +639,22 @@ def create_order():
         })
 
         if DATABASE_URL:
+            conn = None
+            cur = None
             try:
                 conn = get_db()
                 cur  = conn.cursor()
+                stock_error = reserve_stock(cur, rzp_order["id"], items)
+                if stock_error:
+                    conn.rollback()
+                    cur.close()
+                    conn.close()
+                    return jsonify({
+                        "error": "Sold out",
+                        "code": "OUT_OF_STOCK",
+                        "product_id": stock_error.get("product_id"),
+                        "product_name": stock_error.get("product_name")
+                    }), 409
                 cur.execute("""
                     INSERT INTO orders
                         (order_id, razorpay_order_id, amount, currency, status,
@@ -461,7 +681,17 @@ def create_order():
                 cur.close()
                 conn.close()
             except Exception as e:
+                try:
+                    if conn:
+                        conn.rollback()
+                    if cur:
+                        cur.close()
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
                 print("[DB] create_order save error:", e)
+                return jsonify({"error": "Could not reserve stock. Please try again."}), 500
 
         return jsonify({
             "razorpay_order_id": rzp_order["id"],
@@ -504,9 +734,12 @@ def verify_payment():
         confirmed_at = datetime.utcnow()
 
         if DATABASE_URL:
+            conn = None
+            cur = None
             try:
                 conn = get_db()
                 cur  = conn.cursor()
+                mark_stock_reservation_paid(cur, rzp_order_id)
                 cur.execute("""
                     INSERT INTO orders
                         (order_id, razorpay_order_id, razorpay_payment_id,
@@ -536,6 +769,15 @@ def verify_payment():
                 cur.close()
                 conn.close()
             except Exception as e:
+                try:
+                    if conn:
+                        conn.rollback()
+                    if cur:
+                        cur.close()
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
                 print("[DB] verify_payment save error:", e)
 
         print("[ORDER CONFIRMED]", order_id, "|", customer.get("name"), "| Rs.", int(amount)//100)
