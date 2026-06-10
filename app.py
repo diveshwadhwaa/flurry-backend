@@ -34,15 +34,27 @@ ADMIN_NOTIFY_EMAIL  = os.environ.get("ADMIN_NOTIFY_EMAIL",  SUPPORT_EMAIL)
 AUTH_SECRET         = os.environ.get("AUTH_SECRET",         ADMIN_SECRET_KEY)
 AUTH_MAX_AGE        = 60 * 60 * 24 * 30
 STOCK_HOLD_MINUTES  = int(os.environ.get("STOCK_HOLD_MINUTES", "5"))
+_razorpay_client    = None
 
 # Lazy imports so server starts even if packages have issues
 def get_razorpay_client():
+    global _razorpay_client
+    if _razorpay_client:
+        return _razorpay_client
     import razorpay
-    return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    _razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    return _razorpay_client
 
 def get_db():
     import psycopg2
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    url = DATABASE_URL
+    # Neon gives postgres:// but psycopg2 needs postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    # If sslmode is already in the URL don't pass it again (causes conflict)
+    if "sslmode=" in url:
+        return psycopg2.connect(url, connect_timeout=8)
+    return psycopg2.connect(url, sslmode="require", connect_timeout=8)
 
 def init_db():
     if not DATABASE_URL:
@@ -424,8 +436,30 @@ def send_order_email(order_id, customer, items, amount, payment_id=""):
 
 @app.route("/", methods=["GET"])
 def health():
+    try:
+        get_razorpay_client()
+    except Exception as e:
+        print("[WARMUP] Razorpay client warmup skipped:", e)
     return jsonify({"status": "ok", "message": "Flurry Buddy backend is running!"})
 
+
+@app.route("/debug/db", methods=["GET"])
+def debug_db():
+    if not DATABASE_URL:
+        return jsonify({"ok": False, "error": "DATABASE_URL is not set"}), 500
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM orders")
+        count = cur.fetchone()[0]
+        cur.execute("SELECT order_id, customer_name, amount, confirmed_at FROM orders ORDER BY confirmed_at DESC LIMIT 5")
+        rows = cur.fetchall()
+        recent = [{"order_id": r[0], "name": r[1], "amount_rs": (r[2] or 0)//100, "date": str(r[3])} for r in rows]
+        cur.close()
+        conn.close()
+        return jsonify({"ok": True, "total_orders": count, "recent_orders": recent})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 @app.route("/inventory", methods=["GET"])
 def public_inventory():
     if not DATABASE_URL:
@@ -629,10 +663,7 @@ def create_order():
         data     = request.get_json()
         amount   = int(data.get("amount", 0))
         currency = data.get("currency", "INR")
-        customer = data.get("customer", {})
         items    = data.get("items", [])
-        auth_user, _ = get_auth_user(required=False)
-        user_id = auth_user.get("id") if auth_user else None
 
         if amount <= 0:
             return jsonify({"error": "Invalid amount"}), 400
@@ -662,28 +693,6 @@ def create_order():
                         "product_id": stock_error.get("product_id"),
                         "product_name": stock_error.get("product_name")
                     }), 409
-                cur.execute("""
-                    INSERT INTO orders
-                        (order_id, razorpay_order_id, amount, currency, status,
-                         customer_name, customer_email, customer_phone,
-                         customer_address, customer_city, customer_state,
-                         customer_pin, items, user_id, created_at)
-                    VALUES (%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                    ON CONFLICT (order_id) DO NOTHING
-                """, (
-                    "PENDING-" + rzp_order["id"],
-                    rzp_order["id"],
-                    amount, currency,
-                    customer.get("name",""),
-                    customer.get("email",""),
-                    customer.get("phone",""),
-                    customer.get("address",""),
-                    customer.get("city",""),
-                    customer.get("state",""),
-                    customer.get("pin",""),
-                    json.dumps(items),
-                    user_id
-                ))
                 conn.commit()
                 cur.close()
                 conn.close()
